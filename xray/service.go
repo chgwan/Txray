@@ -8,6 +8,7 @@ import (
 	"Txray/log"
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"time"
@@ -93,25 +94,56 @@ func run(node protocols.Protocol) bool {
 		log.Infof("暂不支持%v协议", node.GetProtocolMode())
 		return false
 	}
-	stdout, _ := Xray.StdoutPipe()
-	_ = Xray.Start()
-	r := bufio.NewReader(stdout)
-	lines := new([]string)
-	go readInfo(r, lines)
-	status := make(chan struct{})
-	go checkProc(Xray, status)
-	stopper := time.NewTimer(time.Millisecond * 300)
-	select {
-	case <-stopper.C:
-		setting.SetPid(Xray.Process.Pid)
-		return true
-	case <-status:
-		log.Error("开启xray服务失败, 查看下面报错信息来检查出错问题")
-		for _, x := range *lines {
-			log.Error(x)
-		}
+	stdout, err := Xray.StdoutPipe()
+	if err != nil {
+		log.Errorf("开启xray服务失败, 无法获取stdout: %v", err)
 		return false
 	}
+	stderr, err := Xray.StderrPipe()
+	if err != nil {
+		log.Errorf("开启xray服务失败, 无法获取stderr: %v", err)
+		return false
+	}
+	if err := Xray.Start(); err != nil {
+		log.Errorf("开启xray服务失败: %v", err)
+		return false
+	}
+	lines := new([]string)
+	go readInfo(bufio.NewReader(stdout), lines)
+	go readInfo(bufio.NewReader(stderr), lines)
+
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", setting.Socks())
+	httpPort := setting.Http()
+	addrs := []string{socksAddr}
+	if httpPort != 0 {
+		addrs = append(addrs, fmt.Sprintf("127.0.0.1:%d", httpPort))
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for _, addr := range addrs {
+		if !waitForPort(addr, deadline) {
+			log.Error("开启xray服务失败, 查看下面报错信息来检查出错问题")
+			time.Sleep(100 * time.Millisecond)
+			for _, x := range *lines {
+				log.Error(x)
+			}
+			return false
+		}
+	}
+	setting.SetPid(Xray.Process.Pid)
+	return true
+}
+
+// waitForPort tries to connect to addr until deadline, returning true on success.
+func waitForPort(addr string, deadline time.Time) bool {
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
 }
 
 // Stop 停止服务
@@ -158,10 +190,4 @@ func readInfo(r *bufio.Reader, lines *[]string) {
 			*lines = append(*lines, string(line[:]))
 		}
 	}
-}
-
-// 检查进程状态
-func checkProc(c *exec.Cmd, status chan struct{}) {
-	c.Wait()
-	status <- struct{}{}
 }
